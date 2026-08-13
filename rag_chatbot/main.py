@@ -7,13 +7,14 @@ Endpoints:
     GET  /health          -> liveness check
     POST /query            -> ask a question (multi-turn, keyed by session_id)
     POST /upload            -> upload a new document; auto-embeds and adds it to the index
-    POST /reindex            -> full rebuild of the FAISS index from ./documents
+    POST /reindex            -> full rebuild of the Pinecone index from ./documents
     POST /reset-session       -> clear chat history for a session_id
 
 Run locally:
     uvicorn main:app --reload
 """
 
+import os
 import shutil
 import uuid
 from pathlib import Path
@@ -21,15 +22,15 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from pinecone import Pinecone
 
-import rag_chain
 from rag_chain import answer_question, invalidate_vectorstore_cache, reset_session
-from ingest import add_file_to_index, LOADER_BY_SUFFIX
+from ingest import add_file_to_index, LOADER_BY_SUFFIX, PINECONE_INDEX_NAME
 
 app = FastAPI(
     title="RAG Chatbot API",
-    description="Ask questions over your own documents using LangChain + FAISS + Gemini.",
-    version="2.0.0",
+    description="Ask questions over your own documents using LangChain + Pinecone + Gemini.",
+    version="3.0.0",
 )
 
 app.add_middleware(
@@ -40,7 +41,17 @@ app.add_middleware(
 )
 
 DOCUMENTS_DIR = Path(__file__).parent / "documents"
-INDEX_DIR = Path(__file__).parent / "faiss_index"
+
+
+def _index_has_vectors() -> bool:
+    """Checks Pinecone directly (not a local cache) so /health reflects reality
+    even right after a fresh deploy where nothing's been loaded into memory yet."""
+    try:
+        pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+        stats = pc.Index(PINECONE_INDEX_NAME).describe_index_stats()
+        return stats.get("total_vector_count", 0) > 0
+    except Exception:
+        return False
 
 
 # ---------- Schemas ----------
@@ -76,13 +87,13 @@ class UploadResponse(BaseModel):
 def health():
     return {
         "status": "ok",
-        "index_ready": INDEX_DIR.exists() and any(INDEX_DIR.iterdir()),
+        "index_ready": _index_has_vectors(),
     }
 
 
 @app.post("/query", response_model=QueryResponse)
 def query(request: QueryRequest):
-    if not (INDEX_DIR.exists() and any(INDEX_DIR.iterdir())):
+    if not _index_has_vectors():
         raise HTTPException(
             status_code=400,
             detail="No index found. Add files to ./documents and run `python ingest.py`, "
@@ -125,8 +136,8 @@ async def upload(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to index '{file.filename}': {e}")
 
-    # The vectorstore/chain were built against the old index -- drop the cache so
-    # the next /query call reloads the updated index from disk.
+    # Drop the cached vectorstore/chain so the next /query call reflects the
+    # newly-upserted vectors (Pinecone itself is already updated at this point).
     invalidate_vectorstore_cache()
 
     return UploadResponse(
@@ -138,7 +149,7 @@ async def upload(file: UploadFile = File(...)):
 
 @app.post("/reindex")
 def reindex():
-    """Rebuild the FAISS index from scratch using everything currently in ./documents."""
+    """Rebuild the Pinecone index from scratch using everything currently in ./documents."""
     try:
         from ingest import build_index
 
@@ -148,7 +159,8 @@ def reindex():
     except SystemExit:
         raise HTTPException(
             status_code=400,
-            detail="Reindex failed. Check that ./documents has files and OPENAI_API_KEY is set.",
+            detail="Reindex failed. Check that ./documents has files and PINECONE_API_KEY/"
+            "GOOGLE_API_KEY are set.",
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

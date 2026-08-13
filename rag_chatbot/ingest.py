@@ -2,8 +2,13 @@
 ingest.py
 
 Reads every document in ./documents (PDF, TXT, MD), splits them into
-overlapping chunks, embeds them with OpenAI, and persists a FAISS index
-to ./faiss_index so main.py can load it at query time.
+overlapping chunks, embeds them with Gemini, and upserts them into your
+Pinecone index so main.py can query it at retrieval time.
+
+Unlike FAISS, Pinecone is a persistent hosted store -- there's no local index
+folder to save/load. You must create the index once yourself first, in the
+Pinecone dashboard or API, with dimension=3072 (matches gemini-embedding-001's
+default output) and metric=cosine.
 
 Run this whenever you add or change files in ./documents:
 
@@ -20,23 +25,21 @@ from langchain_community.document_loaders import (
     TextLoader,
 )
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_pinecone import PineconeVectorStore
+from pinecone import Pinecone
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 load_dotenv()
 
 DOCUMENTS_DIR = Path(__file__).parent / "documents"
-INDEX_DIR = Path(__file__).parent / "faiss_index"
 
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 1000))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 150))
-# Gemini's hosted embeddings -- switched back from local (sentence-transformers)
-# because that pulled in PyTorch, which exceeded Render's free-tier 512MB RAM limit
-# and crashed the deployed app. Gemini's embedding endpoint has an occasional
-# intermittent 500 error (known issue, not specific to this app), so calls here are
-# wrapped with retries below.
+# Gemini's hosted embeddings. Note: gemini-embedding-001 defaults to 3072
+# dimensions -- your Pinecone index must be created with dimension=3072 to match.
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001")
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "ask-your-docs")
 
 LOADER_BY_SUFFIX = {
     ".pdf": PyPDFLoader,
@@ -44,6 +47,8 @@ LOADER_BY_SUFFIX = {
     ".md": TextLoader,
 }
 
+# Gemini's embedding endpoint has an occasional intermittent 500 error (known
+# issue, not specific to this app) -- retry with backoff instead of failing outright.
 _embed_retry = retry(
     stop=stop_after_attempt(4),
     wait=wait_exponential(multiplier=1, min=2, max=20),
@@ -52,14 +57,19 @@ _embed_retry = retry(
 )
 
 
-@_embed_retry
-def _embed_new_documents(chunks, embeddings):
-    return FAISS.from_documents(chunks, embeddings)
+def _get_vectorstore() -> PineconeVectorStore:
+    if not os.getenv("PINECONE_API_KEY"):
+        print("ERROR: PINECONE_API_KEY not set. Add it to .env.")
+        sys.exit(1)
+    pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+    index = pc.Index(PINECONE_INDEX_NAME)
+    embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
+    return PineconeVectorStore(index=index, embedding=embeddings)
 
 
 @_embed_retry
-def _embed_and_add(vectorstore, chunks):
-    vectorstore.add_documents(chunks)
+def _upsert(vectorstore: PineconeVectorStore, chunks):
+    return vectorstore.add_documents(chunks)
 
 
 def load_documents():
@@ -97,6 +107,10 @@ def load_documents():
 
 
 def build_index():
+    """Full rebuild: clears the Pinecone index, then re-embeds everything in
+    ./documents. Use this if you've removed or edited a file (Pinecone has no
+    concept of "this chunk is stale" -- a full clear+rebuild is the simple,
+    correct way to handle deletions/edits)."""
     print(f"Reading documents from {DOCUMENTS_DIR} ...")
     docs = load_documents()
     print(f"Loaded {len(docs)} raw document(s)/page(s).")
@@ -108,20 +122,24 @@ def build_index():
     chunks = splitter.split_documents(docs)
     print(f"Split into {len(chunks)} chunks (size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}).")
 
-    print(f"Embedding chunks with '{EMBEDDING_MODEL}' ...")
-    embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
-    vectorstore = _embed_new_documents(chunks, embeddings)
+    vectorstore = _get_vectorstore()
 
-    INDEX_DIR.mkdir(exist_ok=True)
-    vectorstore.save_local(str(INDEX_DIR))
-    print(f"FAISS index saved to {INDEX_DIR}")
+    print("Clearing existing vectors in Pinecone index...")
+    try:
+        vectorstore.index.delete(delete_all=True)
+    except Exception:
+        pass  # index is already empty -- Pinecone errors on delete_all against an empty index
+
+    print(f"Embedding and upserting {len(chunks)} chunks with '{EMBEDDING_MODEL}' ...")
+    _upsert(vectorstore, chunks)
+    print(f"Done. Vectors are stored in Pinecone index '{PINECONE_INDEX_NAME}'.")
 
 
 def add_file_to_index(file_path: Path):
     """
-    Embed a single new file and add it to the existing FAISS index (or create one
-    if none exists yet). Used by the /upload endpoint so a new document doesn't
-    require re-embedding every previously-ingested file.
+    Embed a single new file and upsert it into the existing Pinecone index.
+    Used by the /upload endpoint so a new document doesn't require re-embedding
+    every previously-ingested file.
     """
     loader_cls = LOADER_BY_SUFFIX.get(file_path.suffix.lower())
     if loader_cls is None:
@@ -141,18 +159,8 @@ def add_file_to_index(file_path: Path):
     )
     chunks = splitter.split_documents(docs)
 
-    embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
-
-    if INDEX_DIR.exists() and any(INDEX_DIR.iterdir()):
-        vectorstore = FAISS.load_local(
-            str(INDEX_DIR), embeddings, allow_dangerous_deserialization=True
-        )
-        _embed_and_add(vectorstore, chunks)
-    else:
-        vectorstore = _embed_new_documents(chunks, embeddings)
-
-    INDEX_DIR.mkdir(exist_ok=True)
-    vectorstore.save_local(str(INDEX_DIR))
+    vectorstore = _get_vectorstore()
+    _upsert(vectorstore, chunks)
     return len(chunks)
 
 

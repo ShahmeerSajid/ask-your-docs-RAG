@@ -1,7 +1,7 @@
 """
 rag_chain.py
 
-Loads the persisted FAISS index and exposes a conversational RAG chain, built with
+Connects to the Pinecone index and exposes a conversational RAG chain, built with
 plain LCEL runnables (langchain.chains' old create_retrieval_chain /
 create_history_aware_retriever helpers were removed in langchain 1.x, so this wires
 the same logic together by hand -- it's a handful of Runnables, not "less" of a RAG
@@ -20,12 +20,12 @@ multiple processes.
 """
 
 import os
-from pathlib import Path
 
 from dotenv import load_dotenv
-from langchain_community.vectorstores import FAISS
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langchain_pinecone import PineconeVectorStore
+from pinecone import Pinecone
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnableLambda
@@ -35,15 +35,11 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 load_dotenv()
 
-INDEX_DIR = Path(__file__).parent / "faiss_index"
-
-# Gemini's hosted embeddings -- switched back from local (sentence-transformers)
-# because that pulled in PyTorch, which exceeded Render's free-tier 512MB RAM limit
-# and crashed the deployed app. Gemini's embedding endpoint has an occasional
-# intermittent 500 error (known issue, not specific to this app), so the retrieval
-# call below is wrapped with retries.
+# Gemini's hosted embeddings. Note: gemini-embedding-001 defaults to 3072
+# dimensions -- the Pinecone index must be created with dimension=3072 to match.
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gemini-3-flash-preview")
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "ask-your-docs")
 TOP_K = int(os.getenv("TOP_K", 4))
 
 CONTEXTUALIZE_SYSTEM_PROMPT = """Given a chat history and the latest user question, \
@@ -100,18 +96,13 @@ def _load_vectorstore():
     if _vectorstore is not None:
         return _vectorstore
 
-    if not INDEX_DIR.exists() or not any(INDEX_DIR.iterdir()):
-        raise RuntimeError(
-            "No FAISS index found. Run `python ingest.py` first (or call /reindex) "
-            "to build one from the files in ./documents."
-        )
+    if not os.getenv("PINECONE_API_KEY"):
+        raise RuntimeError("PINECONE_API_KEY not set. Add it to .env.")
 
+    pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+    index = pc.Index(PINECONE_INDEX_NAME)
     embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
-    _vectorstore = FAISS.load_local(
-        str(INDEX_DIR),
-        embeddings,
-        allow_dangerous_deserialization=True,  # safe: we created this index ourselves
-    )
+    _vectorstore = PineconeVectorStore(index=index, embedding=embeddings)
     return _vectorstore
 
 
