@@ -21,7 +21,8 @@ from langchain_community.document_loaders import (
 )
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 load_dotenv()
 
@@ -30,17 +31,35 @@ INDEX_DIR = Path(__file__).parent / "faiss_index"
 
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 1000))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 150))
-# Local embedding model -- runs on your machine, no API key or network call needed.
-# Google's hosted embedding endpoint has an ongoing, intermittent server-side bug
-# (confirmed by multiple developers), so embeddings run locally instead; Gemini is
-# still used for the chat/generation half in rag_chain.py, which has been reliable.
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+# Gemini's hosted embeddings -- switched back from local (sentence-transformers)
+# because that pulled in PyTorch, which exceeded Render's free-tier 512MB RAM limit
+# and crashed the deployed app. Gemini's embedding endpoint has an occasional
+# intermittent 500 error (known issue, not specific to this app), so calls here are
+# wrapped with retries below.
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001")
 
 LOADER_BY_SUFFIX = {
     ".pdf": PyPDFLoader,
     ".txt": TextLoader,
     ".md": TextLoader,
 }
+
+_embed_retry = retry(
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=1, min=2, max=20),
+    retry=retry_if_exception_type(Exception),
+    reraise=True,
+)
+
+
+@_embed_retry
+def _embed_new_documents(chunks, embeddings):
+    return FAISS.from_documents(chunks, embeddings)
+
+
+@_embed_retry
+def _embed_and_add(vectorstore, chunks):
+    vectorstore.add_documents(chunks)
 
 
 def load_documents():
@@ -89,10 +108,9 @@ def build_index():
     chunks = splitter.split_documents(docs)
     print(f"Split into {len(chunks)} chunks (size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}).")
 
-    print(f"Embedding chunks locally with '{EMBEDDING_MODEL}' (first run downloads "
-          f"the model, ~90MB) ...")
-    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
-    vectorstore = FAISS.from_documents(chunks, embeddings)
+    print(f"Embedding chunks with '{EMBEDDING_MODEL}' ...")
+    embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
+    vectorstore = _embed_new_documents(chunks, embeddings)
 
     INDEX_DIR.mkdir(exist_ok=True)
     vectorstore.save_local(str(INDEX_DIR))
@@ -123,15 +141,15 @@ def add_file_to_index(file_path: Path):
     )
     chunks = splitter.split_documents(docs)
 
-    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+    embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
 
     if INDEX_DIR.exists() and any(INDEX_DIR.iterdir()):
         vectorstore = FAISS.load_local(
             str(INDEX_DIR), embeddings, allow_dangerous_deserialization=True
         )
-        vectorstore.add_documents(chunks)
+        _embed_and_add(vectorstore, chunks)
     else:
-        vectorstore = FAISS.from_documents(chunks, embeddings)
+        vectorstore = _embed_new_documents(chunks, embeddings)
 
     INDEX_DIR.mkdir(exist_ok=True)
     vectorstore.save_local(str(INDEX_DIR))

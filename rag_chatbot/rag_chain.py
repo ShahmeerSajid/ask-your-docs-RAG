@@ -25,23 +25,24 @@ from pathlib import Path
 from dotenv import load_dotenv
 from langchain_community.vectorstores import FAISS
 from langchain_community.chat_message_histories import ChatMessageHistory
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnableLambda
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.chat_history import BaseChatMessageHistory
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 load_dotenv()
 
 INDEX_DIR = Path(__file__).parent / "faiss_index"
 
-# Local embedding model -- runs on your machine, no API key or network call needed.
-# Google's hosted embedding endpoint has an ongoing, intermittent server-side bug
-# (confirmed by multiple developers), so embeddings run locally instead. Gemini is
-# still used below for the chat/generation half, which has been reliable.
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+# Gemini's hosted embeddings -- switched back from local (sentence-transformers)
+# because that pulled in PyTorch, which exceeded Render's free-tier 512MB RAM limit
+# and crashed the deployed app. Gemini's embedding endpoint has an occasional
+# intermittent 500 error (known issue, not specific to this app), so the retrieval
+# call below is wrapped with retries.
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gemini-3-flash-preview")
 TOP_K = int(os.getenv("TOP_K", 4))
 
@@ -66,6 +67,19 @@ Context:
 _vectorstore = None
 _llm = None
 _conversational_chain = None
+
+_embed_retry = retry(
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=1, min=2, max=20),
+    retry=retry_if_exception_type(Exception),
+    reraise=True,
+)
+
+
+@_embed_retry
+def _retrieve_with_retry(retriever, query: str):
+    return retriever.invoke(query)
+
 
 # In-memory chat history store: session_id -> ChatMessageHistory
 _session_store: dict[str, BaseChatMessageHistory] = {}
@@ -92,7 +106,7 @@ def _load_vectorstore():
             "to build one from the files in ./documents."
         )
 
-    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+    embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
     _vectorstore = FAISS.load_local(
         str(INDEX_DIR),
         embeddings,
@@ -162,7 +176,7 @@ def _build_rag_step():
             else question
         )
 
-        docs = retriever.invoke(standalone_question)
+        docs = _retrieve_with_retry(retriever, standalone_question)
         context = _format_docs(docs)
 
         answer = qa_chain.invoke(
