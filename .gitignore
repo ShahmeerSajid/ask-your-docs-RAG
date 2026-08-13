@@ -1,0 +1,8 @@
+.env
+.env.local
+__pycache__/
+node_modules/
+.next/
+faiss_index/
+documents/*
+!documents/.gitkeep
