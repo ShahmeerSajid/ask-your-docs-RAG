@@ -4,14 +4,12 @@ rag_chain.py
 Connects to the Pinecone index and exposes a conversational RAG chain, built with
 plain LCEL runnables (langchain.chains' old create_retrieval_chain /
 create_history_aware_retriever helpers were removed in langchain 1.x, so this wires
-the same logic together by hand -- it's a handful of Runnables, not "less" of a RAG
-pipeline than the deprecated helpers gave you).
+the same logic together by hand).
 
-Multi-turn flow:
-    1. contextualize the latest question against chat history
-       (e.g. "what about his SLAM work?" -> "What has Shahmeer done with SLAM?")
-    2. retrieve relevant chunks using the contextualized question
-    3. answer using only the retrieved context + conversation history
+Flow per question:
+    1. retrieve relevant chunks by embedding the raw question (no LLM call first --
+       see the note in _build_rag_step for why)
+    2. answer using the retrieved context + full conversation history
 
 Chat history is kept in memory per session_id (not persisted to disk -- restarting
 the server clears it). That's fine for a personal/demo project; swap `_session_store`
@@ -41,12 +39,6 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gemini-3.5-flash-lite")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "ask-your-docs")
 TOP_K = int(os.getenv("TOP_K", 4))
-
-CONTEXTUALIZE_SYSTEM_PROMPT = """Given a chat history and the latest user question, \
-which might reference context in the chat history, rewrite it as a standalone \
-question that can be understood without the chat history. Do NOT answer the \
-question -- just rewrite it if needed, otherwise return it as-is. Return ONLY the \
-rewritten question, nothing else."""
 
 QA_SYSTEM_PROMPT = """You are a helpful assistant that answers questions using ONLY \
 the provided context, which comes from the user's own documents.
@@ -137,15 +129,6 @@ def _build_rag_step():
     retriever = vectorstore.as_retriever(search_kwargs={"k": TOP_K})
     llm = _get_llm()
 
-    contextualize_prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", CONTEXTUALIZE_SYSTEM_PROMPT),
-            MessagesPlaceholder("chat_history"),
-            ("human", "{input}"),
-        ]
-    )
-    contextualize_chain = contextualize_prompt | llm | StrOutputParser()
-
     qa_prompt = ChatPromptTemplate.from_messages(
         [
             ("system", QA_SYSTEM_PROMPT),
@@ -159,13 +142,20 @@ def _build_rag_step():
         question = inputs["input"]
         chat_history = inputs.get("chat_history", [])
 
-        standalone_question = (
-            contextualize_chain.invoke({"input": question, "chat_history": chat_history})
-            if chat_history
-            else question
-        )
-
-        docs = _retrieve_with_retry(retriever, standalone_question)
+        # Retrieve using the raw question, embedded FIRST -- before any chat
+        # completion call happens in this request. Retrieval used to run after a
+        # separate "contextualize" chat call that rewrote follow-up questions
+        # (e.g. "which university?" -> "Which university did Shahmeer attend?").
+        # That extra chat call immediately before the embed call reproducibly
+        # triggered a 500 from Gemini's embedding endpoint on every 2nd+ turn in a
+        # conversation. Retrieval now always runs first and uses the raw question;
+        # the final answer generation below still receives the full chat_history,
+        # so multi-turn coherence in the ANSWER is preserved even though retrieval
+        # itself is no longer history-aware. Trade-off: a very pronoun-heavy
+        # follow-up ("what about that?") may retrieve slightly less precisely than
+        # a rewritten version would -- acceptable given the alternative was a
+        # broken 2nd question.
+        docs = _retrieve_with_retry(retriever, question)
         context = _format_docs(docs)
 
         answer = qa_chain.invoke(
