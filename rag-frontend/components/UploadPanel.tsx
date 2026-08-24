@@ -64,7 +64,13 @@ export default function UploadPanel({
       setDeletingFilename(filename);
       try {
         await deleteDocument(filename);
-        await refreshDocs();
+        // Optimistically remove it from the list right away rather than
+        // re-fetching from Pinecone immediately -- delete-by-metadata-filter
+        // isn't instantly consistent server-side, so an immediate re-fetch can
+        // still show the file for a few seconds even though the delete call
+        // itself succeeded. We know it's gone (the call didn't throw), so
+        // update the UI directly instead of waiting on Pinecone to catch up.
+        setDocs((prev) => prev.filter((d) => d.filename !== filename));
         onUploaded(); // also refreshes the health/"indexed" indicator
       } catch (e) {
         setError(e instanceof Error ? e.message : "Delete failed.");
@@ -72,7 +78,7 @@ export default function UploadPanel({
         setDeletingFilename(null);
       }
     },
-    [onUploaded, refreshDocs]
+    [onUploaded]
   );
 
   return (
