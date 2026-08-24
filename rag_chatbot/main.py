@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field
 from pinecone import Pinecone
 
 from rag_chain import answer_question, invalidate_vectorstore_cache, reset_session
-from ingest import add_file_to_index, delete_document, LOADER_BY_SUFFIX, PINECONE_INDEX_NAME
+from ingest import add_file_to_index, delete_document, list_documents, LOADER_BY_SUFFIX, PINECONE_INDEX_NAME
 
 app = FastAPI(
     title="RAG Chatbot API",
@@ -79,6 +79,11 @@ class UploadResponse(BaseModel):
     filename: str
     chunks_added: int
     status: str
+
+
+class DocumentInfo(BaseModel):
+    filename: str
+    chunks: int
 
 
 # ---------- Endpoints ----------
@@ -171,6 +176,16 @@ def reset_session_endpoint(session_id: str):
     """Clear the conversation history for a given session_id (starts that chat fresh)."""
     reset_session(session_id)
     return {"status": "session reset", "session_id": session_id}
+
+
+@app.get("/documents", response_model=list[DocumentInfo])
+def list_documents_endpoint():
+    """List every distinct file currently indexed, with its chunk count."""
+    try:
+        docs = list_documents()
+        return [DocumentInfo(filename=d["filename"], chunks=d["chunks"]) for d in docs]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.delete("/documents/{filename}")

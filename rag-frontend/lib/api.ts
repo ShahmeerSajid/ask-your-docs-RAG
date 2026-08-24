@@ -17,6 +17,11 @@ export type HealthResponse = {
   index_ready: boolean;
 };
 
+export type DocumentInfo = {
+  filename: string;
+  chunks: number;
+};
+
 async function handle<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let detail = res.statusText;
@@ -64,6 +69,18 @@ export async function resetSession(sessionId: string): Promise<void> {
   await fetch(`${API_URL}/reset-session?session_id=${encodeURIComponent(sessionId)}`, {
     method: "POST",
   });
+}
+
+export async function listDocuments(): Promise<DocumentInfo[]> {
+  const res = await fetch(`${API_URL}/documents`, { cache: "no-store" });
+  return handle<DocumentInfo[]>(res);
+}
+
+export async function deleteDocument(filename: string): Promise<void> {
+  const res = await fetch(`${API_URL}/documents/${encodeURIComponent(filename)}`, {
+    method: "DELETE",
+  });
+  await handle(res);
 }
 
 export { API_URL };

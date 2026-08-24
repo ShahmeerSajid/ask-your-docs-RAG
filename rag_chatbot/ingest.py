@@ -164,6 +164,36 @@ def add_file_to_index(file_path: Path):
     return len(chunks)
 
 
+def list_documents() -> list[dict]:
+    """
+    Returns [{"filename": str, "chunks": int}, ...] for every distinct source file
+    currently in the Pinecone index. Pinecone has no native "list distinct metadata
+    values" call, so this pages through every vector ID (index.list()) and fetches
+    metadata in batches, tallying by the `source` field set during ingest/upload.
+    Fine for a personal-scale index (hundreds-low thousands of chunks); would need
+    a different approach (e.g. tracking filenames in a separate small DB) at
+    much larger scale.
+    """
+    if not os.getenv("PINECONE_API_KEY"):
+        raise RuntimeError("PINECONE_API_KEY not set.")
+    pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+    index = pc.Index(PINECONE_INDEX_NAME)
+
+    counts: dict[str, int] = {}
+    for id_batch in index.list():
+        if not id_batch:
+            continue
+        fetched = index.fetch(ids=id_batch)
+        for vec in fetched.vectors.values():
+            source = (vec.metadata or {}).get("source", "unknown")
+            counts[source] = counts.get(source, 0) + 1
+
+    return [
+        {"filename": name, "chunks": count}
+        for name, count in sorted(counts.items())
+    ]
+
+
 def delete_document(filename: str) -> None:
     """
     Remove every chunk that came from a specific file, identified by the
