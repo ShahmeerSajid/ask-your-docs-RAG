@@ -164,5 +164,19 @@ def add_file_to_index(file_path: Path):
     return len(chunks)
 
 
+def delete_document(filename: str) -> None:
+    """
+    Remove every chunk that came from a specific file, identified by the
+    `source` metadata field set during ingest/upload. Pinecone serverless
+    supports delete-by-metadata-filter (a newer capability -- older serverless
+    indexes didn't have this).
+    """
+    if not os.getenv("PINECONE_API_KEY"):
+        raise RuntimeError("PINECONE_API_KEY not set.")
+    pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+    index = pc.Index(PINECONE_INDEX_NAME)
+    index.delete(filter={"source": {"$eq": filename}})
+
+
 if __name__ == "__main__":
     build_index()

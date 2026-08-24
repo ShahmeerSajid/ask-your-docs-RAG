@@ -38,7 +38,7 @@ load_dotenv()
 # Gemini's hosted embeddings. Note: gemini-embedding-001 defaults to 3072
 # dimensions -- the Pinecone index must be created with dimension=3072 to match.
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001")
-CHAT_MODEL = os.getenv("CHAT_MODEL", "gemini-3-flash-preview")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gemini-3.5-flash-lite")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "ask-your-docs")
 TOP_K = int(os.getenv("TOP_K", 4))
 
@@ -59,10 +59,6 @@ Rules:
 Context:
 {context}
 """
-
-_vectorstore = None
-_llm = None
-_conversational_chain = None
 
 _embed_retry = retry(
     stop=stop_after_attempt(4),
@@ -92,32 +88,34 @@ def reset_session(session_id: str) -> None:
 
 
 def _load_vectorstore():
-    global _vectorstore
-    if _vectorstore is not None:
-        return _vectorstore
-
+    """
+    Builds a fresh Pinecone/Gemini-embeddings client every call -- NOT cached as a
+    module global. Caching this client across requests caused a real, reproducible
+    bug: FastAPI's sync endpoints run in a threadpool, so a request can land on a
+    different thread than the one that created the client. The underlying gRPC
+    connection is bound to its creating thread/event loop, so reusing it from a
+    different thread fails with an opaque 500 error -- which is exactly the "works
+    on the first question, fails on the second" pattern this project hit. Rebuilding
+    per-request costs a small amount of setup time but is correct under threading.
+    """
     if not os.getenv("PINECONE_API_KEY"):
         raise RuntimeError("PINECONE_API_KEY not set. Add it to .env.")
 
     pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
     index = pc.Index(PINECONE_INDEX_NAME)
     embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
-    _vectorstore = PineconeVectorStore(index=index, embedding=embeddings)
-    return _vectorstore
+    return PineconeVectorStore(index=index, embedding=embeddings)
 
 
 def invalidate_vectorstore_cache() -> None:
-    """Call this after the index changes on disk (e.g. after /upload or /reindex)."""
-    global _vectorstore, _conversational_chain
-    _vectorstore = None
-    _conversational_chain = None
+    """No-op now that nothing is cached -- kept so main.py's existing calls to this
+    (after /upload, /reindex) don't need to change."""
+    pass
 
 
 def _get_llm():
-    global _llm
-    if _llm is None:
-        _llm = ChatGoogleGenerativeAI(model=CHAT_MODEL, temperature=0.2)
-    return _llm
+    """Fresh chat client per call, same reasoning as _load_vectorstore above."""
+    return ChatGoogleGenerativeAI(model=CHAT_MODEL, temperature=0.2)
 
 
 def _format_docs(docs) -> str:
@@ -179,20 +177,16 @@ def _build_rag_step():
 
 
 def _build_conversational_chain():
-    global _conversational_chain
-    if _conversational_chain is not None:
-        return _conversational_chain
-
+    """Built fresh per call -- see _load_vectorstore for why nothing here is cached."""
     rag_step = _build_rag_step()
 
-    _conversational_chain = RunnableWithMessageHistory(
+    return RunnableWithMessageHistory(
         rag_step,
         _get_session_history,
         input_messages_key="input",
         history_messages_key="chat_history",
         output_messages_key="answer",
     )
-    return _conversational_chain
 
 
 def answer_question(question: str, session_id: str) -> dict:
