@@ -1,5 +1,3 @@
-## PDF_RAG_ChatBot using 
-
 Try it out: https://ask-your-docs-rag.vercel.app
 
 
